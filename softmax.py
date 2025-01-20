@@ -112,12 +112,19 @@ def softmax(x):
         kernel = softmax_kernel.warmup(y, x, x.stride(0), y.stride(0), n_rows, n_cols, BLOCK_SIZE=BLOCK_SIZE,
                                        num_stages=num_stages, num_warps=num_warps, grid=(1, ))
         kernel._init_handles()
+        # 共享内存（shared memory) 是一种在 threadblock线程块 内能访问的内存，是片上（on chip）存储，不同 threadblock的共享内存是隔离的
+        # 寄存器（register）是thread能独立访问的资源，它是片上（on chip）存储，用来存储一些thread的暂存数据。thread数据超载，nvcc会部分数据放到片下的local memory
+        # 综上：由于一个sm上，shared memory和register的总量是有限的，公同制约了block的数量
+
         n_regs = kernel.n_regs #看起来这个kernel更像是cuda里面的thread的概念, n_regs对应每个thread的寄存器数
-        size_smem = kernel.metadata.shared #size_smem对应每个block的共享内存大小
+        size_smem = kernel.metadata.shared #size_smem对应每个threadblock的共享内存大小
         occupancy = NUM_REGS // (n_regs * WARP_SIZE * num_warps) # 每个sm 65536 // (28 * 32 * 8) = 9/8
         occupancy = min(occupancy, SIZE_SMEM // size_smem) # 每个sm 166912 / 4128 = 40, 根据硬件限制，计算每个sm的block数
         num_programs = NUM_SM * occupancy #类似cuda计算grid的划分，即block的shape, 108 * 9/8 = 972/864，occupancy对应每个sm的block数
         kernels[BLOCK_SIZE] = (kernel, num_programs)
+
+        # shared memory 与 L1 缓存的位置、速度极其类似，
+        # 共享内存受用户控制，L1 受系统控制 
 
 
     num_programs = min(num_programs, n_rows)
