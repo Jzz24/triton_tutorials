@@ -15,7 +15,7 @@ def standard_softmax_attention(Q, K, V):
 def flash_attn_v2(Q, K, V):
     seq_length, q_head_dim = Q.shape[0], Q.shape[1]
     k_seq_length, k_head_dim = K.shape[0], K.shape[1]
-    v_seq_length, v_head_dim = K.shape[0], K.shape[1]
+    v_seq_length, v_head_dim = V.shape[0], V.shape[1]
     assert q_head_dim == k_head_dim
     assert k_seq_length == v_seq_length
     Br = min(int(SHM_BLOCK_SIZE / 4 / q_head_dim), q_head_dim)
@@ -25,10 +25,8 @@ def flash_attn_v2(Q, K, V):
     # output = []
     for i in range(0, seq_length, Br):
         Qi = Q[i:i+Br, :]
-        # Mi = torch.zeros(Br, 1)
-        Mi = M[i:i+Br, :]
-        # Li = torch.ones(Br, 1)
-        Li = torch.zeros(Br, 1) #自行修改
+        Mi = M[i:i+Br, :] # (Br, 1), 初始为0
+        Li = torch.zeros(Br, 1)
         oi = O[i:i+Br, :]
 
         for j in range(0, k_seq_length, Bc):
@@ -36,32 +34,31 @@ def flash_attn_v2(Q, K, V):
             Vj = V[j:j+Bc, :]
             Sij = Qi @ Kj.T
             
+            # 1.1 计算当前分块的Sij的local max, 
+            # 1.2 更新 Mi, Mi表示截止j-1块的max
+            # 1.3 更新 Mi_new, Mi_new表示截止j块的最新max
+            # 当外循环i时，内循环j不断更新行块的 Mi, Mi_new
             mij_hat = torch.max(Sij, dim=1).values[:, None]
-            # pij_hat = torch.exp(Sij - mij_hat)
-            # lij_hat = torch.sum(pij_hat, dim=1)[:, None]
-            
-            # Mi_new = torch.max(torch.column_stack([Mi, torch.max(Sij, dim=1).values[:, None]]), dim=1).values[:, None]
-            Mi_new = torch.max(torch.column_stack([Mi, mij_hat]), dim=1).values[:, None] 
-            #当外循环i时，内循环j不断更新行块的m。Mi_new表示截止j块的最新max，Mi表示截止j-1块的max, Mi初始化为0
-            Pij = torch.exp(Sij - Mi_new)
+            Mi_new = torch.max(torch.column_stack([Mi, mij_hat]), dim=1).values[:, None]
 
-            # Li = torch.exp(Mi - Mi_new) * Li + torch.sum(Pij, dim=-1)[:, None]
-            # Li_new表示截止j块的最新softmax分母，Li表示截止j-1块的softmax分母，Li初始化为1
+
+            # 2.1 计算当前分块的softmax分子, Pij
+            # 2.2 online softmax的矫正因子为 torch.exp(Mi - Mi_new)
+            # 2.3 计算截止j块的最新softmax分母 Li_new, 注意矫正Li的计算结果, Li表示截止j-1块的softmax分母
+            Pij = torch.exp(Sij - Mi_new)
             Li_new = torch.exp(Mi - Mi_new) * Li + torch.sum(Pij, dim=-1)[:, None]
-            
-            #oi初始化为0
+
+
+            # 3.1 计算当前j分块的 Pij @ Vj 输出
+            # 所有分块的j循环输出，累加到oi上，注意矫正oi的计算结果, oi表示截止j-1块的attention输出
+            # 3.2 矫正j-1块的oi, 并累加当前j块的输出
+            # 3.3 更新Mi, Li
             oi = oi * torch.exp(Mi - Mi_new) + Pij @ Vj
-            # Mi = Mi_new
-            # import ipdb; ipdb.set_trace()
             Mi = Mi_new
             Li = Li_new
-            # print (i,j, seq_length, k_seq_length)
         
-        # Oi = Oi / Li
+        # 4. j循环外围，归一化输出 Oi = oi / Li
         O[i:i+Br, :] = oi / Li
-        # output.append(Oi)
-    # res = torch.row_stack(output)
-    # return res
     return O
 
 def test_flash_v2():
@@ -71,15 +68,12 @@ def test_flash_v2():
     K_mat = torch.rand((N, d))
     V_mat = torch.rand((N, d))
 
-    # 执行flash attention计算
     flash_attention_v2_output = flash_attn_v2(Q_mat, K_mat, V_mat)
 
-    # 执行标准的PyTorch softmax和attention计算
     _, expected_attention = standard_softmax_attention(Q_mat, K_mat, V_mat)
-    print(flash_attention_v2_output)
-    print(expected_attention)
+    # print(flash_attention_v2_output)
+    # print(expected_attention)
     print ('max diff', (flash_attention_v2_output - expected_attention).max())
-    # 断言flash attention计算的结果与标准计算结果是否接近
     assert torch.allclose(flash_attention_v2_output, expected_attention), "Error in flash attention calculation"
 
 
